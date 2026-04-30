@@ -46,3 +46,4 @@ Add this env variable in Railway:
   AI_MODEL = meta-llama/llama-3.3-70b-instruct:free  (default, free)
 
 Full model list: https://openrouter.ai/models
+update
