@@ -6,7 +6,7 @@ import tempfile
 from datetime import datetime, timedelta
 
 from openai import OpenAI
-from faster_whisper import WhisperModel
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -26,7 +26,7 @@ client = OpenAI(
 )
 
 # Loads tiny Whisper model on startup (~75MB, runs on Railway free tier)
-whisper = WhisperModel("tiny", device="cpu", compute_type="int8")
+
 
 # ── Database ──────────────────────────────────────────────────────────────────
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
