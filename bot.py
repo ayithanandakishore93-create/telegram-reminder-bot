@@ -10,7 +10,9 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 OPENROUTER_KEY = os.environ["OPENROUTER_KEY"]
 
 # ✅ USE STABLE MODEL (no :free)
-MODEL = "meta-llama/llama-3-8b-instruct"
+
+
+MODEL = os.environ.get("AI_MODEL", "openai/gpt-3.5-turbo")
 
 
 # ================= REMINDER PARSER =================
