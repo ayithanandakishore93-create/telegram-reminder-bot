@@ -8,7 +8,9 @@ from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTyp
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OPENROUTER_KEY = os.environ["OPENROUTER_KEY"]
-MODEL = "meta-llama/llama-3-8b-instruct:free"
+
+# ✅ USE STABLE MODEL (no :free)
+MODEL = "meta-llama/llama-3-8b-instruct"
 
 
 # ================= REMINDER PARSER =================
@@ -41,12 +43,50 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ================= AI CALL =================
+
+def ask_ai(text):
+    try:
+        r = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_KEY}",
+                "Content-Type": "application/json",
+
+                # 🔥 REQUIRED FOR OPENROUTER (THIS FIXES YOUR ISSUE)
+                "HTTP-Referer": "https://example.com",
+                "X-Title": "JarvisBot"
+            },
+            json={
+                "model": MODEL,
+                "messages": [
+                    {"role": "user", "content": text}
+                ],
+            },
+            timeout=30,
+        )
+
+        print("STATUS:", r.status_code)
+        print("RAW:", r.text)
+
+        if r.status_code != 200:
+            return "⚠️ AI server error. Try again."
+
+        data = r.json()
+
+        return data["choices"][0]["message"]["content"]
+
+    except Exception as e:
+        print("AI ERROR:", e)
+        return "⚠️ AI temporarily unavailable"
+
+
 # ================= MAIN HANDLER =================
 
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
 
-    # 🔹 1. LOCAL REMINDER LOGIC (NO AI)
+    # 🔹 1. REMINDER (NO AI)
     if "remind me" in text.lower():
         parsed = parse_reminder(text)
 
@@ -74,31 +114,11 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"🔁 Reminder every {minutes} minutes")
                 return
 
-        await update.message.reply_text("❌ Use: remind me in 1 minute to ...")
+        await update.message.reply_text("❌ Try: remind me in 1 minute to call mom")
         return
 
-    # 🔹 2. AI CHAT (SAFE VERSION)
-    try:
-        r = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": MODEL,
-                "messages": [{"role": "user", "content": text}],
-            },
-            timeout=20,
-        )
-
-        r.raise_for_status()
-        reply = r.json()["choices"][0]["message"]["content"]
-
-    except Exception as e:
-        print("AI ERROR:", e)
-        reply = "⚠️ AI is temporarily unavailable"
-
+    # 🔹 2. AI CHAT
+    reply = ask_ai(text)
     await update.message.reply_text(reply)
 
 
