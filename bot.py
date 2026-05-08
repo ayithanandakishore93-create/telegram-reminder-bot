@@ -1,6 +1,5 @@
 import os
 import re
-import json
 import sqlite3
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -24,14 +23,11 @@ from telegram.ext import (
     filters,
 )
 
-# =========================
-# CONFIG
-# =========================
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OPENROUTER_KEY = os.environ["OPENROUTER_KEY"]
 AI_MODEL = os.getenv("AI_MODEL", "openai/gpt-4o-mini")
-
 DB_PATH = os.getenv("DB_PATH", "/data/jarvis.db")
+
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "").strip()
 CALENDAR_WEBHOOK_URL = os.getenv("CALENDAR_WEBHOOK_URL", "").strip()
 OBSIDIAN_DIR = os.getenv("OBSIDIAN_DIR", "").strip()
@@ -117,7 +113,48 @@ def ensure_tables():
     conn.commit()
 
 
+def table_columns(name: str) -> set[str]:
+    rows = cursor.execute(f"PRAGMA table_info({name})").fetchall()
+    return {r[1] for r in rows}
+
+
+def migrate_reminders():
+    cols = table_columns("reminders")
+
+    if "rule_key" not in cols:
+        cursor.execute("ALTER TABLE reminders ADD COLUMN rule_key TEXT")
+    if "trigger_time" not in cols:
+        cursor.execute("ALTER TABLE reminders ADD COLUMN trigger_time TEXT")
+    if "repeat_minutes" not in cols:
+        cursor.execute("ALTER TABLE reminders ADD COLUMN repeat_minutes INTEGER DEFAULT 0")
+    if "status" not in cols:
+        cursor.execute("ALTER TABLE reminders ADD COLUMN status TEXT DEFAULT 'pending'")
+    if "task" not in cols:
+        cursor.execute("ALTER TABLE reminders ADD COLUMN task TEXT")
+    if "chat_id" not in cols:
+        cursor.execute("ALTER TABLE reminders ADD COLUMN chat_id INTEGER")
+
+    cols = table_columns("reminders")
+
+    if "time" in cols:
+        cursor.execute("""
+            UPDATE reminders
+            SET trigger_time = COALESCE(trigger_time, time)
+            WHERE trigger_time IS NULL OR trigger_time = ''
+        """)
+
+    if "repeat" in cols:
+        cursor.execute("""
+            UPDATE reminders
+            SET repeat_minutes = COALESCE(repeat_minutes, repeat)
+            WHERE repeat_minutes IS NULL OR repeat_minutes = 0
+        """)
+
+    conn.commit()
+
+
 ensure_tables()
+migrate_reminders()
 
 # =========================
 # TIME HELPERS
@@ -132,6 +169,34 @@ def normalize_dt(dt: datetime) -> datetime:
     return dt.astimezone(TZ)
 
 
+def parse_hhmm(value: str | None, default: tuple[int, int]) -> tuple[int, int]:
+    if not value:
+        return default
+
+    text = str(value).strip().lower()
+    m = re.search(r"(\d{1,2}):(\d{2})", text)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+
+    try:
+        dt = dateparser.parse(
+            text,
+            settings={
+                "TIMEZONE": "Asia/Kolkata",
+                "RETURN_AS_TIMEZONE_AWARE": True,
+                "PREFER_DATES_FROM": "future",
+                "RELATIVE_BASE": now_ist(),
+            },
+            languages=["en"],
+        )
+        if dt:
+            return dt.hour, dt.minute
+    except Exception:
+        pass
+
+    return default
+
+
 def next_time_today_or_tomorrow(hour: int, minute: int) -> datetime:
     dt = now_ist().replace(hour=hour, minute=minute, second=0, microsecond=0)
     if dt <= now_ist():
@@ -142,10 +207,10 @@ def next_time_today_or_tomorrow(hour: int, minute: int) -> datetime:
 def next_weekday_datetime(weekday: int, hour: int, minute: int) -> datetime:
     now = now_ist()
     dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    days_ahead = (weekday - dt.weekday()) % 7
-    if days_ahead == 0 and dt <= now:
-        days_ahead = 7
-    return dt + timedelta(days=days_ahead)
+    delta = (weekday - dt.weekday()) % 7
+    if delta == 0 and dt <= now:
+        delta = 7
+    return dt + timedelta(days=delta)
 
 
 def parse_date_phrase(text: str) -> datetime | None:
@@ -211,7 +276,7 @@ def write_obsidian(folder: str, title: str, content: str):
         print("Obsidian write error:", e)
 
 # =========================
-# STORAGE
+# MEMORY / STORAGE
 # =========================
 def save_chat(chat_id: int, role: str, content: str):
     cursor.execute(
@@ -221,7 +286,7 @@ def save_chat(chat_id: int, role: str, content: str):
     conn.commit()
 
 
-def recent_history(chat_id: int, limit: int = 12) -> list[sqlite3.Row]:
+def recent_history(chat_id: int, limit: int = 12):
     rows = cursor.execute(
         """
         SELECT role, content
@@ -235,37 +300,81 @@ def recent_history(chat_id: int, limit: int = 12) -> list[sqlite3.Row]:
     return list(reversed(rows))
 
 
-def save_memory(key: str, value: str):
+def get_latest_memory(key: str, default: str | None = None) -> str | None:
+    row = cursor.execute(
+        """
+        SELECT value
+        FROM memories
+        WHERE lower(key)=lower(?)
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (key,),
+    ).fetchone()
+    return row["value"] if row else default
+
+
+def infer_memory_category(text: str) -> str:
+    low = text.lower()
+
+    if any(k in low for k in ["goal", "vision", "want to build", "my target", "my aim"]):
+        return "goal"
+    if any(k in low for k in ["habit", "routine", "daily"]):
+        return "habit"
+    if any(k in low for k in ["health", "gym", "sleep", "diet", "moringa", "water"]):
+        return "health"
+    if any(k in low for k in ["people", "mom", "dad", "brother", "sister", "friend"]):
+        return "people"
+    if any(k in low for k in ["startup", "blackleaf", "combina", "founder"]):
+        return "startup notes"
+    if any(k in low for k in ["college", "study", "exam", "physics", "chemistry", "math"]):
+        return "study"
+    return "memory"
+
+
+def save_memory(user_id, category: str, content: str):
     cursor.execute(
         "INSERT INTO memories (key, value) VALUES (?, ?)",
-        (key.strip(), value.strip()),
+        (category.strip(), content.strip()),
     )
     conn.commit()
-    post_webhook(N8N_WEBHOOK_URL, {"type": "memory", "key": key, "value": value})
-    write_obsidian("memories", key, f"# {key}\n\n{value}")
+    post_webhook(N8N_WEBHOOK_URL, {"type": "memory", "category": category, "content": content, "user_id": user_id})
+    write_obsidian("memories", category, f"# {category}\n\n{content}")
     return cursor.lastrowid
 
 
+def get_memories():
+    return cursor.execute(
+        "SELECT id, key, value FROM memories ORDER BY id DESC LIMIT 50"
+    ).fetchall()
+
+
 def save_note(text: str):
-    cursor.execute(
-        "INSERT INTO notes (text) VALUES (?)",
-        (text.strip(),),
-    )
+    cursor.execute("INSERT INTO notes (text) VALUES (?)", (text.strip(),))
     conn.commit()
     post_webhook(N8N_WEBHOOK_URL, {"type": "note", "text": text})
     write_obsidian("notes", "note", text)
     return cursor.lastrowid
 
 
+def get_notes():
+    return cursor.execute(
+        "SELECT id, text FROM notes ORDER BY id DESC LIMIT 50"
+    ).fetchall()
+
+
 def save_idea(text: str):
-    cursor.execute(
-        "INSERT INTO ideas (text) VALUES (?)",
-        (text.strip(),),
-    )
+    cursor.execute("INSERT INTO ideas (text) VALUES (?)", (text.strip(),))
     conn.commit()
     post_webhook(N8N_WEBHOOK_URL, {"type": "idea", "text": text})
     write_obsidian("ideas", "idea", text)
     return cursor.lastrowid
+
+
+def get_ideas():
+    return cursor.execute(
+        "SELECT id, text FROM ideas ORDER BY id DESC LIMIT 50"
+    ).fetchall()
 
 
 def save_task(text: str):
@@ -280,29 +389,20 @@ def save_task(text: str):
 
 def get_tasks():
     return cursor.execute(
-        "SELECT id, text, status FROM tasks ORDER BY id DESC LIMIT 30"
+        "SELECT id, text, status FROM tasks ORDER BY id DESC LIMIT 50"
     ).fetchall()
 
 
-def get_memories():
-    return cursor.execute(
-        "SELECT id, key, value FROM memories ORDER BY id DESC LIMIT 30"
-    ).fetchall()
-
-
-def get_notes():
-    return cursor.execute(
-        "SELECT id, text FROM notes ORDER BY id DESC LIMIT 30"
-    ).fetchall()
-
-
-def get_ideas():
-    return cursor.execute(
-        "SELECT id, text FROM ideas ORDER BY id DESC LIMIT 30"
-    ).fetchall()
+def mark_task_done(task_id: int):
+    cursor.execute(
+        "UPDATE tasks SET status='done' WHERE id=?",
+        (task_id,),
+    )
+    conn.commit()
 
 
 def save_reminder(chat_id: int, task: str, trigger_time: datetime, repeat_minutes: int = 0, rule_key: str | None = None):
+    trigger_time = normalize_dt(trigger_time)
     cursor.execute(
         """
         INSERT INTO reminders (chat_id, rule_key, task, trigger_time, repeat_minutes, status)
@@ -312,12 +412,23 @@ def save_reminder(chat_id: int, task: str, trigger_time: datetime, repeat_minute
             chat_id,
             rule_key,
             task.strip(),
-            normalize_dt(trigger_time).isoformat(),
+            trigger_time.isoformat(),
             int(repeat_minutes),
         ),
     )
     conn.commit()
-    return cursor.lastrowid
+    reminder_id = cursor.lastrowid
+
+    post_webhook(CALENDAR_WEBHOOK_URL, {
+        "type": "calendar_event",
+        "reminder_id": reminder_id,
+        "chat_id": chat_id,
+        "task": task,
+        "trigger_time": trigger_time.isoformat(),
+        "repeat_minutes": int(repeat_minutes),
+    })
+
+    return reminder_id
 
 
 def upsert_rule_reminder(chat_id: int, rule_key: str, task: str, trigger_time: datetime, repeat_minutes: int):
@@ -325,6 +436,8 @@ def upsert_rule_reminder(chat_id: int, rule_key: str, task: str, trigger_time: d
         "SELECT id FROM reminders WHERE rule_key=?",
         (rule_key,),
     ).fetchone()
+
+    trigger_time = normalize_dt(trigger_time)
 
     if row:
         reminder_id = row["id"]
@@ -337,12 +450,22 @@ def upsert_rule_reminder(chat_id: int, rule_key: str, task: str, trigger_time: d
             (
                 chat_id,
                 task.strip(),
-                normalize_dt(trigger_time).isoformat(),
+                trigger_time.isoformat(),
                 int(repeat_minutes),
                 reminder_id,
             ),
         )
         conn.commit()
+
+        post_webhook(CALENDAR_WEBHOOK_URL, {
+            "type": "calendar_event",
+            "reminder_id": reminder_id,
+            "chat_id": chat_id,
+            "task": task,
+            "trigger_time": trigger_time.isoformat(),
+            "repeat_minutes": int(repeat_minutes),
+        })
+
         return reminder_id
 
     return save_reminder(chat_id, task, trigger_time, repeat_minutes, rule_key=rule_key)
@@ -371,19 +494,6 @@ def mark_reminder_done(reminder_id: int):
     cursor.execute(
         "UPDATE reminders SET status='done' WHERE id=?",
         (reminder_id,),
-    )
-    conn.commit()
-
-
-def delete_reminder(reminder_id: int):
-    cursor.execute("DELETE FROM reminders WHERE id=?", (reminder_id,))
-    conn.commit()
-
-
-def mark_task_done(task_id: int):
-    cursor.execute(
-        "UPDATE tasks SET status='done' WHERE id=?",
-        (task_id,),
     )
     conn.commit()
 
@@ -427,10 +537,12 @@ def classify_message(text: str) -> str:
         return "idea"
     if low.startswith("task:") or low.startswith("add task") or low.startswith("task "):
         return "task"
-    if "plan my day" in low or low == "/plan" or low == "plan":
+    if "plan my day" in low or low in {"plan", "/plan"}:
         return "plan"
-    if "review my day" in low or low == "/review" or low == "review":
+    if "review my day" in low or low in {"review", "/review"}:
         return "review"
+    if "run workflow" in low or low.startswith("workflow:") or "send this to n8n" in low:
+        return "workflow"
 
     prompt = f"""
 Classify this user message for a personal Telegram assistant.
@@ -439,7 +551,7 @@ Message:
 {text}
 
 Return only one word from:
-reminder, memory, note, idea, task, plan, review, chat
+reminder, memory, note, idea, task, plan, review, workflow, chat
 """
     try:
         out = openrouter_chat(
@@ -450,7 +562,7 @@ reminder, memory, note, idea, task, plan, review, chat
             temperature=0.0,
         ).lower().strip()
         out = re.sub(r"[^a-z]", "", out)
-        if out in {"reminder", "memory", "note", "idea", "task", "plan", "review", "chat"}:
+        if out in {"reminder", "memory", "note", "idea", "task", "plan", "review", "workflow", "chat"}:
             return out
     except Exception:
         pass
@@ -459,16 +571,21 @@ reminder, memory, note, idea, task, plan, review, chat
 
 
 def ai_chat_with_context(chat_id: int, text: str) -> str:
-    memories = "\n".join([f"- {r['key']}: {r['value']}" for r in get_memories()[:15]]) or "None"
-    notes = "\n".join([f"- {r['text']}" for r in get_notes()[:10]]) or "None"
-    ideas = "\n".join([f"- {r['text']}" for r in get_ideas()[:10]]) or "None"
-    tasks = "\n".join([f"- [{r['status']}] {r['text']}" for r in get_tasks()[:15]]) or "None"
+    memories = "\n".join([f"- {r['key']}: {r['value']}" for r in get_memories()[:20]]) or "None"
+    notes = "\n".join([f"- {r['text']}" for r in get_notes()[:12]]) or "None"
+    ideas = "\n".join([f"- {r['text']}" for r in get_ideas()[:12]]) or "None"
+    tasks = "\n".join([f"- [{r['status']}] {r['text']}" for r in get_tasks()[:20]]) or "None"
     history = recent_history(chat_id, 10)
     history_text = "\n".join([f"{r['role'].upper()}: {r['content']}" for r in history]) or "None"
 
     system = f"""
 You are Jarvis Lite, a personal second brain for the user.
-Be practical, short, and helpful.
+
+Be:
+- short
+- useful
+- natural
+- practical
 
 User memory:
 {memories}
@@ -495,16 +612,80 @@ Recent chat:
     )
 
 # =========================
+# PLANNING
+# =========================
+def build_adaptive_plan():
+    wake_hour, wake_min = parse_hhmm(get_latest_memory("wake_time", "08:00"), (8, 0))
+    study_hour, study_min = parse_hhmm(get_latest_memory("study_time", "20:00"), (20, 0))
+    review_hour, review_min = parse_hhmm(get_latest_memory("review_time", "21:30"), (21, 30))
+
+    wake = next_time_today_or_tomorrow(wake_hour, wake_min)
+    freshen = wake + timedelta(minutes=5)
+    plan = [
+        (wake, "Wake up and start the day"),
+        (freshen, "Freshen up and get ready"),
+        (wake + timedelta(minutes=30), "Breakfast"),
+        (wake + timedelta(minutes=50), "Leave for college"),
+        (now_ist().replace(hour=9, minute=0, second=0, microsecond=0), "College"),
+        (now_ist().replace(hour=16, minute=0, second=0, microsecond=0), "Gym"),
+        (now_ist().replace(hour=18, minute=30, second=0, microsecond=0), "Finish gym and return"),
+        (now_ist().replace(hour=18, minute=45, second=0, microsecond=0), "Eat and recover"),
+        (now_ist().replace(hour=study_hour, minute=study_min, second=0, microsecond=0), "Study for 1 hour"),
+        (now_ist().replace(hour=review_hour, minute=review_min, second=0, microsecond=0), "Review the day and plan tomorrow"),
+        (now_ist().replace(hour=22, minute=0, second=0, microsecond=0), "Sleep on time"),
+    ]
+
+    # Fix times that have already passed today
+    fixed = []
+    for dt, title in plan:
+        dt = normalize_dt(dt)
+        if dt <= now_ist():
+            if title in {"College", "Gym", "Finish gym and return", "Eat and recover"}:
+                fixed.append((dt, title))
+            else:
+                dt += timedelta(days=1)
+                fixed.append((dt, title))
+        else:
+            fixed.append((dt, title))
+
+    # Add startup focus block if there are pending tasks/ideas
+    pending_tasks = [r for r in get_tasks() if r["status"] == "pending"]
+    if pending_tasks:
+        start = now_ist().replace(hour=20, minute=15, second=0, microsecond=0)
+        if start <= now_ist():
+            start += timedelta(days=1)
+        fixed.append((start, "BLACKLEAF focus block"))
+        fixed = sorted(fixed, key=lambda x: x[0])
+
+    return fixed
+
+
+def build_week_plan():
+    return [
+        ("Monday", "Day 1 — Build Your Story Brain"),
+        ("Tuesday", "Day 2 — Fast Thinking Engine"),
+        ("Wednesday", "Day 3 — Improvisation Training"),
+        ("Thursday", "Day 4 — Founder Story Creation"),
+        ("Friday", "Day 5 — Persuasion Techniques"),
+        ("Saturday", "Day 6 — Pressure Communication"),
+        ("Sunday", "Day 7 — Founder Simulation"),
+    ]
+
+# =========================
 # REMINDER PARSING
 # =========================
 def extract_task_from_reminder(text: str) -> str:
     body = re.sub(r"(?i)^remind me(?: to)?\s*", "", text).strip()
-    body = re.sub(r"(?i)\b(every day|everyday|daily|each day)\b", " ", body)
-    body = TIME_RE.sub(" ", body)
-    body = re.sub(r"(?i)\b(?:today|tomorrow|tonight|morning|evening|night|noon|midnight|at|on|in|by|after|before)\b", " ", body)
+
     if " to " in body.lower():
-        body = body.lower().split(" to ")[-1]
+        body = body.rsplit(" to ", 1)[-1].strip()
+
+    body = TIME_RE.sub(" ", body)
+    body = re.sub(r"(?i)\b(every day|everyday|daily|each day|today|tomorrow|tonight|morning|evening|night|after lunch|before sleep|before sleeping)\b", " ", body)
+    body = re.sub(r"(?i)\b(at|on|in|by|after|before)\b", " ", body)
+    body = re.sub(r"(?i)\b(and|or)\b", " ", body)
     body = re.sub(r"\s+", " ", body).strip(" ,.-")
+
     return body or "Reminder"
 
 
@@ -514,34 +695,36 @@ def parse_reminder_items(text: str):
         return []
 
     daily = any(k in low for k in ["every day", "everyday", "daily", "each day"])
-    items = []
+    weekly = any(k in low for k in ["every week", "weekly", "each week"])
 
-    # 1) In X minutes/hours
+    # 1) in X minutes / hours
     m = re.search(r"(?i)^remind me in (\d+)\s*(minute|minutes|min|hour|hours|hr|hrs)\s*(?:to\s+)?(.+)$", text.strip())
     if m:
         amount = int(m.group(1))
         unit = m.group(2).lower()
         task = m.group(3).strip()
-        minutes = amount * 60 if "hour" in unit or unit in {"hr", "hrs"} else amount
-        items.append({"task": task, "when": now_ist() + timedelta(minutes=minutes), "repeat_minutes": 0})
-        return items
+        minutes = amount * 60 if unit in {"hour", "hours", "hr", "hrs"} else amount
+        return [{"task": task, "when": now_ist() + timedelta(minutes=minutes), "repeat_minutes": 0}]
 
+    # 2) remind me to TASK in X ...
     m = re.search(r"(?i)^remind me(?: to)? (.+?) in (\d+)\s*(minute|minutes|min|hour|hours|hr|hrs)$", text.strip())
     if m:
         task = m.group(1).strip()
         amount = int(m.group(2))
         unit = m.group(3).lower()
-        minutes = amount * 60 if "hour" in unit or unit in {"hr", "hrs"} else amount
-        items.append({"task": task, "when": now_ist() + timedelta(minutes=minutes), "repeat_minutes": 0})
-        return items
+        minutes = amount * 60 if unit in {"hour", "hours", "hr", "hrs"} else amount
+        return [{"task": task, "when": now_ist() + timedelta(minutes=minutes), "repeat_minutes": 0}]
 
-    # 2) Weekday recurring like "every monday at 8:30 pm"
-    m = re.search(r"(?i)\b(?:every|each)\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b.*", text)
-    if m:
-        weekday = WEEKDAY_MAP[m.group(1).lower()]
-        times = TIME_RE.findall(text)
-        task = extract_task_from_reminder(text)
+    task = extract_task_from_reminder(text)
+
+    # 3) weekday + clock time
+    wd_match = re.search(r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", low)
+    if wd_match:
+        weekday = WEEKDAY_MAP[wd_match.group(1)]
+        times = TIME_RE.findall(low)
         if times:
+            repeat_minutes = 10080 if weekly else 0
+            items = []
             for h, mi, ap in times:
                 hour = int(h)
                 minute = int(mi or 0)
@@ -551,14 +734,14 @@ def parse_reminder_items(text: str):
                 if ap == "am" and hour == 12:
                     hour = 0
                 dt = next_weekday_datetime(weekday, hour, minute)
-                items.append({"task": task, "when": dt, "repeat_minutes": 10080})
+                items.append({"task": task, "when": dt, "repeat_minutes": repeat_minutes})
             return items
 
-    # 3) Multiple clock times in one daily reminder
-    times = TIME_RE.findall(text)
+    # 4) multiple clock times in one reminder
+    times = TIME_RE.findall(low)
     if times:
-        task = extract_task_from_reminder(text)
-        repeat = 1440 if daily else 0
+        repeat_minutes = 1440 if daily else 0
+        items = []
         for h, mi, ap in times:
             hour = int(h)
             minute = int(mi or 0)
@@ -570,30 +753,19 @@ def parse_reminder_items(text: str):
             dt = now_ist().replace(hour=hour, minute=minute, second=0, microsecond=0)
             if dt <= now_ist():
                 dt += timedelta(days=1)
-            items.append({"task": task, "when": dt, "repeat_minutes": repeat})
+            items.append({"task": task, "when": dt, "repeat_minutes": repeat_minutes})
         return items
 
-    # 4) Tomorrow / specific date / in X style fallback
+    # 5) natural language date parsing
     cleaned = re.sub(r"(?i)^remind me(?: to)?\s*", "", text).strip()
-    when_text = cleaned
-    if " to " in cleaned.lower():
-        when_text = cleaned.lower().split(" to ")[0].strip()
-        task = cleaned.lower().split(" to ")[-1].strip()
-        dt = parse_date_phrase(when_text)
-        if dt:
-            items.append({"task": task, "when": dt, "repeat_minutes": 0})
-            return items
-
     dt = parse_date_phrase(cleaned)
     if dt:
-        task = extract_task_from_reminder(text)
-        items.append({"task": task, "when": dt, "repeat_minutes": 0})
-        return items
+        return [{"task": task, "when": dt, "repeat_minutes": 0}]
 
     return []
 
 # =========================
-# SCHEDULER
+# JOBS / SCHEDULER
 # =========================
 def reminder_keyboard(reminder_id: int):
     return InlineKeyboardMarkup([
@@ -601,66 +773,34 @@ def reminder_keyboard(reminder_id: int):
             InlineKeyboardButton("✅ Done", callback_data=f"done:{reminder_id}"),
             InlineKeyboardButton("⏰ Snooze 1m", callback_data=f"snooze:1:{reminder_id}"),
             InlineKeyboardButton("⏰ Snooze 10m", callback_data=f"snooze:10:{reminder_id}"),
+            InlineKeyboardButton("😴 Skip today", callback_data=f"skip:{reminder_id}"),
         ]
     ])
 
 
-def cancel_jobs(app, reminder_id: int):
-    for name in (f"base_{reminder_id}", f"nag_{reminder_id}"):
-        for job in app.job_queue.get_jobs_by_name(name):
-            job.schedule_removal()
+def cancel_job_by_name(app, name: str):
+    for job in app.job_queue.get_jobs_by_name(name):
+        job.schedule_removal()
 
 
-def schedule_base_job(app, row, first_time: datetime | None = None):
-    reminder_id = int(row["id"])
-    chat_id = int(row["chat_id"])
-    task = row["task"]
-    repeat_minutes = int(row["repeat_minutes"] or 0)
-    trigger_time = normalize_dt(first_time or datetime.fromisoformat(row["trigger_time"]))
-    if repeat_minutes > 0:
-        job = app.job_queue.run_repeating(
-            send_reminder,
-            interval=timedelta(minutes=repeat_minutes),
-            first=trigger_time,
-            chat_id=chat_id,
-            data={
-                "reminder_id": reminder_id,
-                "task": task,
-                "repeat_minutes": repeat_minutes,
-                "trigger_time": trigger_time.isoformat(),
-                "is_base": True,
-            },
-            name=f"base_{reminder_id}",
-        )
-        return job
-    else:
-        delay = max(5, int((trigger_time - now_ist()).total_seconds()))
-        job = app.job_queue.run_once(
-            send_reminder,
-            when=delay,
-            chat_id=chat_id,
-            data={
-                "reminder_id": reminder_id,
-                "task": task,
-                "repeat_minutes": 0,
-                "trigger_time": trigger_time.isoformat(),
-                "is_base": True,
-            },
-            name=f"base_{reminder_id}",
-        )
-        return job
+def cancel_nag_jobs(app, reminder_id: int):
+    cancel_job_by_name(app, f"nag_{reminder_id}")
+
+
+def cancel_all_jobs(app, reminder_id: int):
+    cancel_job_by_name(app, f"base_{reminder_id}")
+    cancel_job_by_name(app, f"nag_{reminder_id}")
 
 
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
-    d = job.data
+    d = job.data or {}
     reminder_id = int(d["reminder_id"])
     row = get_reminder(reminder_id)
     if not row or row["status"] != "pending":
         return
 
     task = row["task"]
-    repeat_minutes = int(row["repeat_minutes"] or 0)
 
     await context.bot.send_message(
         chat_id=int(row["chat_id"]),
@@ -668,18 +808,15 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
         reply_markup=reminder_keyboard(reminder_id),
     )
 
-    # keep nagging every 1 minute until user acts
-    if not context.application.job_queue.get_jobs_by_name(f"nag_{reminder_id}"):
-        context.application.job_queue.run_once(
-            nag_reminder,
-            when=60,
-            chat_id=int(row["chat_id"]),
-            data={"reminder_id": reminder_id},
-            name=f"nag_{reminder_id}",
-        )
-
-    # For repeating reminders, the base repeating job handles future occurrences.
-    # If this is the first run after an overdue start, nothing else is needed.
+    # keep nagging every minute until user acts
+    cancel_nag_jobs(context.application, reminder_id)
+    context.application.job_queue.run_once(
+        nag_reminder,
+        when=60,
+        chat_id=int(row["chat_id"]),
+        data={"reminder_id": reminder_id},
+        name=f"nag_{reminder_id}",
+    )
 
 
 async def nag_reminder(context: ContextTypes.DEFAULT_TYPE):
@@ -695,6 +832,7 @@ async def nag_reminder(context: ContextTypes.DEFAULT_TYPE):
         reply_markup=reminder_keyboard(reminder_id),
     )
 
+    cancel_nag_jobs(context.application, reminder_id)
     context.application.job_queue.run_once(
         nag_reminder,
         when=60,
@@ -702,6 +840,46 @@ async def nag_reminder(context: ContextTypes.DEFAULT_TYPE):
         data={"reminder_id": reminder_id},
         name=f"nag_{reminder_id}",
     )
+
+
+def schedule_base_job(app, row, first_time: datetime | None = None):
+    reminder_id = int(row["id"])
+    chat_id = int(row["chat_id"])
+    task = row["task"]
+    repeat_minutes = int(row["repeat_minutes"] or 0)
+
+    trigger_time = normalize_dt(first_time or datetime.fromisoformat(row["trigger_time"]))
+
+    if repeat_minutes > 0:
+        app.job_queue.run_repeating(
+            send_reminder,
+            interval=repeat_minutes * 60,
+            first=trigger_time,
+            chat_id=chat_id,
+            data={
+                "reminder_id": reminder_id,
+                "task": task,
+                "repeat_minutes": repeat_minutes,
+                "trigger_time": trigger_time.isoformat(),
+                "is_base": True,
+            },
+            name=f"base_{reminder_id}",
+        )
+    else:
+        delay = max(5, int((trigger_time - now_ist()).total_seconds()))
+        app.job_queue.run_once(
+            send_reminder,
+            when=delay,
+            chat_id=chat_id,
+            data={
+                "reminder_id": reminder_id,
+                "task": task,
+                "repeat_minutes": 0,
+                "trigger_time": trigger_time.isoformat(),
+                "is_base": True,
+            },
+            name=f"base_{reminder_id}",
+        )
 
 
 def schedule_existing_reminders(app):
@@ -739,23 +917,15 @@ def schedule_existing_reminders(app):
 def schedule_rule_reminder(app, chat_id: int, rule_key: str, task: str, trigger_time: datetime, repeat_minutes: int):
     reminder_id = upsert_rule_reminder(chat_id, rule_key, task, trigger_time, repeat_minutes)
     row = get_reminder(reminder_id)
-    cancel_jobs(app, reminder_id)
+    cancel_all_jobs(app, reminder_id)
     schedule_base_job(app, row, first_time=normalize_dt(trigger_time))
-    if CALENDAR_WEBHOOK_URL:
-        post_webhook(CALENDAR_WEBHOOK_URL, {
-            "type": "calendar_event",
-            "task": task,
-            "trigger_time": normalize_dt(trigger_time).isoformat(),
-            "repeat_minutes": repeat_minutes,
-            "chat_id": chat_id,
-        })
     return reminder_id
 
 # =========================
-# DEFAULT SCHEDULES
+# SCHEDULES
 # =========================
 def setup_daily_routine(app, chat_id: int):
-    routine = [
+    morning = [
         ("daily_wake", "Wake up and start the day", 8, 0, 1440),
         ("daily_freshen", "Freshen up and get ready", 8, 5, 1440),
         ("daily_plan", "Plan the day for 2 minutes", 8, 10, 1440),
@@ -766,13 +936,13 @@ def setup_daily_routine(app, chat_id: int):
         ("daily_gym_end", "Finish gym and return", 18, 30, 1440),
         ("daily_eat", "Eat and recover", 18, 45, 1440),
         ("daily_study", "Study for 1 hour", 20, 0, 1440),
-        ("daily_review", "Review the day and plan tomorrow", 21, 30, 1440),
+        ("daily_review", "Daily review: What did you complete today? What blocked you? Top priority tomorrow? Mood 1-10?", 21, 30, 1440),
         ("daily_sleep", "Sleep on time", 22, 0, 1440),
     ]
 
     lines = ["✅ Daily routine reminders set:"]
 
-    for rule_key, task, hour, minute, repeat in routine:
+    for rule_key, task, hour, minute, repeat in morning:
         dt = next_time_today_or_tomorrow(hour, minute)
         rid = schedule_rule_reminder(app, chat_id, rule_key, task, dt, repeat)
         lines.append(f"- {task} at {dt.strftime('%I:%M %p')} (id {rid})")
@@ -789,7 +959,7 @@ def setup_weekly_communication(app, chat_id: int):
         ("week_fri_persuasion", 4, 20, 30, "Day 5 — Persuasion Techniques"),
         ("week_sat_pressure", 5, 20, 30, "Day 6 — Pressure Communication"),
         ("week_sun_sim", 6, 20, 30, "Day 7 — Founder Simulation"),
-        ("week_plan_next", 6, 21, 0, "Plan next week"),
+        ("week_plan_next", 6, 21, 0, "Plan next week based on college, gym, startup, study, and energy level"),
     ]
 
     lines = ["✅ Weekly reminders set:"]
@@ -800,37 +970,121 @@ def setup_weekly_communication(app, chat_id: int):
     return lines
 
 
-def fixed_plan_blocks():
-    return [
-        ("08:00", "Wake up"),
-        ("08:05", "Freshen up / bath"),
-        ("08:10", "Plan the day for 2 minutes"),
-        ("08:30", "Breakfast"),
-        ("08:50", "Leave for college"),
-        ("09:00", "College"),
-        ("16:00", "Gym"),
-        ("18:30", "Finish gym and return"),
-        ("18:45", "Eat and recover"),
-        ("20:00", "Study for 1 hour"),
-        ("21:30", "Review the day and plan tomorrow"),
-        ("22:00", "Sleep on time"),
+def build_adaptive_plan():
+    wake_hour, wake_min = parse_hhmm(get_latest_memory("wake_time", "08:00"), (8, 0))
+    study_hour, study_min = parse_hhmm(get_latest_memory("study_time", "20:00"), (20, 0))
+    review_hour, review_min = parse_hhmm(get_latest_memory("review_time", "21:30"), (21, 30))
+
+    wake = next_time_today_or_tomorrow(wake_hour, wake_min)
+
+    plan = [
+        (wake, "Wake up and start the day"),
+        (wake + timedelta(minutes=5), "Freshen up and get ready"),
+        (wake + timedelta(minutes=30), "Breakfast"),
+        (wake + timedelta(minutes=50), "Finish morning prep and leave for college"),
+        (wake.replace(hour=9, minute=0), "College"),
+        (wake.replace(hour=16, minute=0), "Gym"),
+        (wake.replace(hour=18, minute=30), "Finish gym and return"),
+        (wake.replace(hour=18, minute=45), "Eat and recover"),
+        (wake.replace(hour=study_hour, minute=study_min), "Study for 1 hour"),
+        (wake.replace(hour=review_hour, minute=review_min), "Review the day and plan tomorrow"),
+        (wake.replace(hour=22, minute=0), "Sleep on time"),
     ]
+
+    tasks = [r for r in get_tasks() if r["status"] == "pending"]
+    if tasks:
+        focus = wake.replace(hour=20, minute=15)
+        plan.append((focus, "BLACKLEAF focus block"))
+
+    seen = []
+    for dt, title in plan:
+        dt = normalize_dt(dt)
+        if title not in {"College", "Gym", "Finish gym and return", "Eat and recover"} and dt <= now_ist():
+            dt += timedelta(days=1)
+        seen.append((dt, title))
+
+    seen.sort(key=lambda x: x[0])
+    return seen
+
+
+# =========================
+# CALLBACKS
+# =========================
+async def reminder_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    parts = q.data.split(":")
+    action = parts[0]
+
+    if action in {"done", "skip"}:
+        reminder_id = int(parts[1])
+        row = get_reminder(reminder_id)
+        if not row:
+            await q.edit_message_text("Reminder not found.")
+            return
+
+        repeat_minutes = int(row["repeat_minutes"] or 0)
+
+        if repeat_minutes == 0:
+            cancel_all_jobs(context.application, reminder_id)
+            mark_reminder_done(reminder_id)
+            await q.edit_message_text("✅ Done.")
+            return
+
+        cancel_nag_jobs(context.application, reminder_id)
+        if action == "skip":
+            await q.edit_message_text("😴 Skipped today.")
+        else:
+            await q.edit_message_text("✅ Done for this occurrence.")
+        return
+
+    if action == "snooze":
+        minutes = int(parts[1])
+        reminder_id = int(parts[2])
+        row = get_reminder(reminder_id)
+        if not row:
+            await q.edit_message_text("Reminder not found.")
+            return
+
+        repeat_minutes = int(row["repeat_minutes"] or 0)
+
+        if repeat_minutes == 0:
+            cancel_all_jobs(context.application, reminder_id)
+        else:
+            cancel_nag_jobs(context.application, reminder_id)
+
+        when = now_ist() + timedelta(minutes=minutes)
+        context.application.job_queue.run_once(
+            send_reminder,
+            when=max(5, int((when - now_ist()).total_seconds())),
+            chat_id=int(row["chat_id"]),
+            data={
+                "reminder_id": reminder_id,
+                "task": row["task"],
+                "repeat_minutes": repeat_minutes,
+                "trigger_time": when.isoformat(),
+                "is_base": False,
+            },
+            name=f"base_{reminder_id}",
+        )
+        await q.edit_message_text(f"⏰ Snoozed for {minutes} minute(s).")
+        return
 
 # =========================
 # COMMANDS
 # =========================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "Hi, I’m Jarvis Lite.\n\n"
+        "🚀 Jarvis Lite activated.\n\n"
         "Try:\n"
         "- remember my goal is build BLACKLEAF\n"
         "- note: startup idea\n"
         "- idea: AI outfit assistant\n"
         "- task: revise communication\n"
         "- remind me tomorrow at 9am to call mom\n"
-        "- set them\n"
         "- plan my day\n"
-        "- show reminders\n\n"
+        "- set them\n\n"
         "Commands:\n"
         "/memory /notes /ideas /tasks /reminders /plan /weekplan /review /setup_lite /done <task_id> /delete <reminder_id> /clear"
     )
@@ -906,7 +1160,7 @@ async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Reminder not found.")
         return
 
-    cancel_jobs(context.application, rid)
+    cancel_all_jobs(context.application, rid)
     mark_reminder_done(rid)
     await update.message.reply_text(f"Deleted reminder {rid}.")
 
@@ -928,16 +1182,18 @@ async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     rows = get_pending_reminders(chat_id)
     for r in rows:
-        cancel_jobs(context.application, int(r["id"]))
+        cancel_all_jobs(context.application, int(r["id"]))
         mark_reminder_done(int(r["id"]))
     await update.message.reply_text("All pending reminders cleared.")
 
 
 async def plan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    blocks = fixed_plan_blocks()
-    text = "📅 Jarvis Lite Plan\n\n" + "\n".join([f"{t} — {task}" for t, task in blocks])
-    text += "\n\nSend `set them` to create the routine reminders."
-    await update.message.reply_text(text)
+    plan = build_adaptive_plan()
+    lines = ["📅 Jarvis Lite Plan:\n"]
+    for dt, title in plan:
+        lines.append(f"{dt.strftime('%I:%M %p')} — {title}")
+    lines.append("\nSend `set them` to create the routine reminders.")
+    await update.message.reply_text("\n".join(lines)[:3900])
 
 
 async def weekplan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -956,17 +1212,16 @@ async def weekplan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def review_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    mem = "\n".join([f"- {r['key']}: {r['value']}" for r in get_memories()[:10]]) or "None"
     tasks = "\n".join([f"- [{r['status']}] {r['text']}" for r in get_tasks()[:10]]) or "None"
+    memories = "\n".join([f"- {r['key']}: {r['value']}" for r in get_memories()[:10]]) or "None"
     text = (
         "📘 Daily review\n\n"
-        "1) What went well?\n"
-        "2) What should improve?\n"
-        "3) What is the first task for tomorrow?\n\n"
-        "Recent memory:\n"
-        f"{mem}\n\n"
-        "Recent tasks:\n"
-        f"{tasks}"
+        "What did you complete today?\n"
+        "What blocked you?\n"
+        "Top priority tomorrow?\n"
+        "Mood 1-10?\n\n"
+        f"Recent memory:\n{memories}\n\n"
+        f"Recent tasks:\n{tasks}"
     )
     await update.message.reply_text(text[:3900])
 
@@ -980,63 +1235,7 @@ async def setup_lite_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
-# CALLBACKS
-# =========================
-async def reminder_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
-    parts = q.data.split(":")
-    action = parts[0]
-
-    if action == "done":
-        reminder_id = int(parts[1])
-        row = get_reminder(reminder_id)
-        if not row:
-            await q.edit_message_text("Already gone.")
-            return
-
-        cancel_jobs(context.application, reminder_id)
-
-        # recurring reminders stay active; one-time reminders are completed
-        if int(row["repeat_minutes"] or 0) == 0:
-            mark_reminder_done(reminder_id)
-            await q.edit_message_text("✅ Done.")
-        else:
-            await q.edit_message_text("✅ Done for this occurrence.")
-        return
-
-    if action == "snooze":
-        minutes = int(parts[1])
-        reminder_id = int(parts[2])
-        row = get_reminder(reminder_id)
-        if not row:
-            await q.edit_message_text("Reminder not found.")
-            return
-
-        cancel_jobs(context.application, reminder_id)
-
-        when = now_ist() + timedelta(minutes=minutes)
-        context.application.job_queue.run_once(
-            send_reminder,
-            when=max(5, int((when - now_ist()).total_seconds())),
-            chat_id=int(row["chat_id"]),
-            data={
-                "reminder_id": reminder_id,
-                "task": row["task"],
-                "repeat_minutes": int(row["repeat_minutes"] or 0),
-                "trigger_time": when.isoformat(),
-                "is_base": False,  # snooze is not the base repeating job
-            },
-            name=f"base_{reminder_id}",
-        )
-
-        await q.edit_message_text(f"⏰ Snoozed for {minutes} minute(s).")
-        return
-
-
-# =========================
-# TEXT HANDLER
+# MAIN CHAT
 # =========================
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
@@ -1044,22 +1243,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     save_chat(update.effective_chat.id, "user", text)
 
-    # quick setup command
     if low in {"set them", "setup lite", "setup", "set up", "start jarvis lite"}:
         await setup_lite_cmd(update, context)
         return
 
-    # memory
     if low.startswith("remember "):
-        m = re.match(r"(?i)^remember (?:my )?(.+?) is (.+)$", text)
-        if m:
-            key = m.group(1).strip()
-            value = m.group(2).strip()
-        else:
-            key = "memory"
-            value = text[len("remember "):].strip()
-        save_memory(key, value)
-        await update.message.reply_text("🧠 Memory saved.")
+        content = text[len("remember "):].strip()
+        category = infer_memory_category(content)
+        save_memory(update.effective_chat.id, category, content)
+        await update.message.reply_text(f"🧠 Memory saved as {category}.")
         return
 
     if "what do you know about me" in low:
@@ -1068,19 +1260,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text_out[:3900])
         return
 
-    # notes
     if low.startswith("note:") or low.startswith("note "):
         save_note(text.split(":", 1)[-1].strip())
         await update.message.reply_text("📝 Note saved.")
         return
 
-    # ideas
     if low.startswith("idea:") or low.startswith("idea "):
         save_idea(text.split(":", 1)[-1].strip())
         await update.message.reply_text("💡 Idea saved.")
         return
 
-    # tasks
     if low.startswith("task:") or low.startswith("add task") or low.startswith("task "):
         task_text = text.split(":", 1)[-1].strip()
         if low.startswith("add task"):
@@ -1101,7 +1290,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await weekplan_cmd(update, context)
         return
 
-    # reminders
+    if low.startswith("run workflow") or low.startswith("workflow:") or "send this to n8n" in low:
+        post_webhook(N8N_WEBHOOK_URL, {
+            "type": "workflow",
+            "chat_id": update.effective_chat.id,
+            "text": text,
+        })
+        await update.message.reply_text("✅ Workflow sent.")
+        return
+
     if any(k in low for k in ["remind me", "reminder", "wake me"]):
         items = parse_reminder_items(text)
 
@@ -1109,26 +1306,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             replies = []
             for item in items:
                 dt = normalize_dt(item["when"])
-                rid = save_reminder(update.effective_chat.id, item["task"], dt, item["repeat_minutes"])
-                row = get_reminder(rid)
+                repeat = int(item["repeat_minutes"] or 0)
+                rid = save_reminder(update.effective_chat.id, item["task"], dt, repeat)
 
                 delay = max(5, int((dt - now_ist()).total_seconds()))
-                if int(item["repeat_minutes"] or 0) > 0:
+                if repeat > 0:
                     context.application.job_queue.run_repeating(
                         send_reminder,
-                        interval=timedelta(minutes=int(item["repeat_minutes"])),
+                        interval=repeat * 60,
                         first=dt,
                         chat_id=update.effective_chat.id,
                         data={
                             "reminder_id": rid,
                             "task": item["task"],
-                            "repeat_minutes": int(item["repeat_minutes"]),
+                            "repeat_minutes": repeat,
                             "trigger_time": dt.isoformat(),
                             "is_base": True,
                         },
                         name=f"base_{rid}",
                     )
-                    replies.append(f"🔁 Reminder set: {item['task']} at {dt.strftime('%I:%M %p')} (daily/weekly repeat)")
+                    replies.append(f"🔁 Reminder set: {item['task']} at {dt.strftime('%I:%M %p')}")
                 else:
                     context.application.job_queue.run_once(
                         send_reminder,
@@ -1148,7 +1345,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("\n".join(replies)[:3900])
             return
 
-        # fallback: ask AI to classify, then parse again
         intent = classify_message(text)
         if intent == "reminder":
             dt = parse_date_phrase(text)
@@ -1175,12 +1371,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("I understood it as a reminder, but I could not parse the time.")
         return
 
-    # classification
     intent = classify_message(text)
 
     if intent == "memory":
-        save_memory("memory", text)
-        await update.message.reply_text("🧠 Memory saved.")
+        category = infer_memory_category(text)
+        save_memory(update.effective_chat.id, category, text)
+        await update.message.reply_text(f"🧠 Memory saved as {category}.")
         return
 
     if intent == "note":
@@ -1206,7 +1402,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await review_cmd(update, context)
         return
 
-    # normal chat
+    if intent == "workflow":
+        post_webhook(N8N_WEBHOOK_URL, {
+            "type": "workflow",
+            "chat_id": update.effective_chat.id,
+            "text": text,
+        })
+        await update.message.reply_text("✅ Workflow sent.")
+        return
+
     reply = ai_chat_with_context(update.effective_chat.id, text)
     save_chat(update.effective_chat.id, "assistant", reply)
     await update.message.reply_text(reply[:3900])
