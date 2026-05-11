@@ -1,8 +1,6 @@
 import os
 import re
-import json
 import sqlite3
-from pathlib import Path
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -31,7 +29,6 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 OPENROUTER_KEY = os.environ["OPENROUTER_KEY"]
 AI_MODEL = os.getenv("AI_MODEL", "openai/gpt-4o-mini")
 DB_PATH = os.getenv("DB_PATH", "/data/jarvis.db")
-
 TZ = ZoneInfo("Asia/Kolkata")
 
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -261,9 +258,84 @@ def parse_date_phrase(text: str) -> datetime | None:
 
     return None
 
+# =========================
+# CLEAN TEXT HELPERS
+# =========================
+def normalize_reminder_text(text: str) -> str:
+    text = text.lower().strip()
+    text = text.replace("a.m.", "am").replace("p.m.", "pm")
+    text = text.replace("a.m", "am").replace("p.m", "pm")
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def format_clock(h, m=None, ap=None):
+    hour = int(h)
+    minute = int(m or 0)
+    ap = (ap or "").lower().strip()
+
+    if ap == "pm" and hour != 12:
+        hour += 12
+    if ap == "am" and hour == 12:
+        hour = 0
+
+    dt = now_ist().replace(hour=hour, minute=minute, second=0, microsecond=0)
+    return dt.strftime("%I:%M %p").lstrip("0")
+
+
+def extract_task_from_reminder(text: str) -> str:
+    body = normalize_reminder_text(text)
+
+    body = re.sub(r"(?i)^remind me(?: to)?\s*", "", body).strip()
+
+    if " to " in body:
+        body = body.rsplit(" to ", 1)[-1].strip()
+
+    body = TIME_RE.sub(" ", body)
+    body = re.sub(
+        r"(?i)\b(every day|everyday|daily|each day|today|tomorrow|tonight|morning|evening|night|after lunch|before sleep|before sleeping)\b",
+        " ",
+        body,
+    )
+    body = re.sub(r"(?i)\b(at|on|in|by|after|before)\b", " ", body)
+    body = re.sub(r"(?i)\b(and|or)\b", " ", body)
+    body = re.sub(r"\s+", " ", body).strip(" ,.-")
+
+    return body or "Reminder"
+
+
+def extract_special_memory(text: str):
+    low = text.lower()
+    results = []
+
+    m = re.search(r"wake up at (\d{1,2})(?::(\d{2}))?\s*(am|pm)?", low)
+    if m:
+        results.append(("wake_time", format_clock(*m.groups())))
+
+    m = re.search(r"study at (\d{1,2})(?::(\d{2}))?\s*(am|pm)?", low)
+    if m:
+        results.append(("study_time", format_clock(*m.groups())))
+
+    m = re.search(r"review at (\d{1,2})(?::(\d{2}))?\s*(am|pm)?", low)
+    if m:
+        results.append(("review_time", format_clock(*m.groups())))
+
+    m = re.search(r"college from (\d{1,2})(?::(\d{2}))?\s*(am|pm)? to (\d{1,2})(?::(\d{2}))?\s*(am|pm)?", low)
+    if m:
+        start = format_clock(m.group(1), m.group(2), m.group(3))
+        end = format_clock(m.group(4), m.group(5), m.group(6))
+        results.append(("college_time", f"{start} to {end}"))
+
+    m = re.search(r"gym from (\d{1,2})(?::(\d{2}))?\s*(am|pm)? to (\d{1,2})(?::(\d{2}))?\s*(am|pm)?", low)
+    if m:
+        start = format_clock(m.group(1), m.group(2), m.group(3))
+        end = format_clock(m.group(4), m.group(5), m.group(6))
+        results.append(("gym_time", f"{start} to {end}"))
+
+    return results
 
 # =========================
-# STORAGE / MEMORY
+# STORAGE
 # =========================
 def save_chat(chat_id: int, role: str, content: str):
     cursor.execute(
@@ -317,51 +389,6 @@ def infer_memory_category(text: str) -> str:
     if any(k in low for k in ["college", "study", "exam", "physics", "chemistry", "math"]):
         return "study"
     return "memory"
-
-
-def extract_special_memory(text: str):
-    low = text.lower()
-    results = []
-
-    m = re.search(r"wake up at (\d{1,2})(?::(\d{2}))?\s*(am|pm)?", low)
-    if m:
-        results.append(("wake_time", _format_clock(*m.groups())))
-
-    m = re.search(r"study at (\d{1,2})(?::(\d{2}))?\s*(am|pm)?", low)
-    if m:
-        results.append(("study_time", _format_clock(*m.groups())))
-
-    m = re.search(r"review at (\d{1,2})(?::(\d{2}))?\s*(am|pm)?", low)
-    if m:
-        results.append(("review_time", _format_clock(*m.groups())))
-
-    m = re.search(r"college from (\d{1,2})(?::(\d{2}))?\s*(am|pm)? to (\d{1,2})(?::(\d{2}))?\s*(am|pm)?", low)
-    if m:
-        start = _format_clock(m.group(1), m.group(2), m.group(3))
-        end = _format_clock(m.group(4), m.group(5), m.group(6))
-        results.append(("college_time", f"{start} to {end}"))
-
-    m = re.search(r"gym from (\d{1,2})(?::(\d{2}))?\s*(am|pm)? to (\d{1,2})(?::(\d{2}))?\s*(am|pm)?", low)
-    if m:
-        start = _format_clock(m.group(1), m.group(2), m.group(3))
-        end = _format_clock(m.group(4), m.group(5), m.group(6))
-        results.append(("gym_time", f"{start} to {end}"))
-
-    return results
-
-
-def _format_clock(h, m=None, ap=None):
-    hour = int(h)
-    minute = int(m or 0)
-    ap = (ap or "").lower().strip()
-
-    if ap == "pm" and hour != 12:
-        hour += 12
-    if ap == "am" and hour == 12:
-        hour = 0
-
-    dt = now_ist().replace(hour=hour, minute=minute, second=0, microsecond=0)
-    return dt.strftime("%I:%M %p").lstrip("0")
 
 
 def save_memory(chat_id, key: str, value: str):
@@ -519,7 +546,6 @@ def mark_reminder_done(reminder_id: int):
     )
     conn.commit()
 
-
 # =========================
 # OPENROUTER
 # =========================
@@ -632,7 +658,6 @@ Recent chat:
         temperature=0.65,
     )
 
-
 # =========================
 # PLANNING
 # =========================
@@ -674,7 +699,6 @@ def build_adaptive_plan():
     fixed.sort(key=lambda x: x[0])
     return fixed
 
-
 def build_week_plan():
     return [
         ("Monday", "Day 1 — Build Your Story Brain"),
@@ -686,27 +710,12 @@ def build_week_plan():
         ("Sunday", "Day 7 — Founder Simulation"),
     ]
 
-
 # =========================
 # REMINDER PARSING
 # =========================
-def extract_task_from_reminder(text: str) -> str:
-    body = re.sub(r"(?i)^remind me(?: to)?\s*", "", text).strip()
-
-    if " to " in body.lower():
-        body = body.rsplit(" to ", 1)[-1].strip()
-
-    body = TIME_RE.sub(" ", body)
-    body = re.sub(r"(?i)\b(every day|everyday|daily|each day|today|tomorrow|tonight|morning|evening|night|after lunch|before sleep|before sleeping)\b", " ", body)
-    body = re.sub(r"(?i)\b(at|on|in|by|after|before)\b", " ", body)
-    body = re.sub(r"(?i)\b(and|or)\b", " ", body)
-    body = re.sub(r"\s+", " ", body).strip(" ,.-")
-
-    return body or "Reminder"
-
-
 def parse_reminder_items(text: str):
-    low = text.lower()
+    low = normalize_reminder_text(text)
+
     if "remind me" not in low and "wake me" not in low:
         return []
 
@@ -714,7 +723,7 @@ def parse_reminder_items(text: str):
     weekly = any(k in low for k in ["every week", "weekly", "each week"])
 
     # in X minutes / hours
-    m = re.search(r"(?i)^remind me in (\d+)\s*(minute|minutes|min|hour|hours|hr|hrs)\s*(?:to\s+)?(.+)$", text.strip())
+    m = re.search(r"(?i)^remind me in (\d+)\s*(minute|minutes|min|hour|hours|hr|hrs)\s*(?:to\s+)?(.+)$", low)
     if m:
         amount = int(m.group(1))
         unit = m.group(2).lower()
@@ -722,7 +731,8 @@ def parse_reminder_items(text: str):
         minutes = amount * 60 if unit in {"hour", "hours", "hr", "hrs"} else amount
         return [{"task": task, "when": now_ist() + timedelta(minutes=minutes), "repeat_minutes": 0}]
 
-    m = re.search(r"(?i)^remind me(?: to)? (.+?) in (\d+)\s*(minute|minutes|min|hour|hours|hr|hrs)$", text.strip())
+    # remind me to TASK in X ...
+    m = re.search(r"(?i)^remind me(?: to)? (.+?) in (\d+)\s*(minute|minutes|min|hour|hours|hr|hrs)$", low)
     if m:
         task = m.group(1).strip()
         amount = int(m.group(2))
@@ -730,7 +740,7 @@ def parse_reminder_items(text: str):
         minutes = amount * 60 if unit in {"hour", "hours", "hr", "hrs"} else amount
         return [{"task": task, "when": now_ist() + timedelta(minutes=minutes), "repeat_minutes": 0}]
 
-    task = extract_task_from_reminder(text)
+    task = extract_task_from_reminder(low)
 
     # weekday + times
     wd_match = re.search(r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", low)
@@ -752,7 +762,7 @@ def parse_reminder_items(text: str):
                 items.append({"task": task, "when": dt, "repeat_minutes": repeat_minutes})
             return items
 
-    # multiple times in one reminder
+    # multiple times in one message
     times = TIME_RE.findall(low)
     if times:
         repeat_minutes = 1440 if daily else 0
@@ -771,13 +781,12 @@ def parse_reminder_items(text: str):
             items.append({"task": task, "when": dt, "repeat_minutes": repeat_minutes})
         return items
 
-    cleaned = re.sub(r"(?i)^remind me(?: to)?\s*", "", text).strip()
+    cleaned = re.sub(r"(?i)^remind me(?: to)?\s*", "", low).strip()
     dt = parse_date_phrase(cleaned)
     if dt:
         return [{"task": task, "when": dt, "repeat_minutes": 0}]
 
     return []
-
 
 # =========================
 # JOBS / SCHEDULER
@@ -935,7 +944,6 @@ def schedule_rule_reminder(app, chat_id: int, rule_key: str, task: str, trigger_
     schedule_base_job(app, row, first_time=normalize_dt(trigger_time))
     return reminder_id
 
-
 # =========================
 # SCHEDULES
 # =========================
@@ -983,7 +991,6 @@ def setup_weekly_communication(app, chat_id: int):
         rid = schedule_rule_reminder(app, chat_id, rule_key, task, dt, 10080)
         lines.append(f"- {task} at {dt.strftime('%a %I:%M %p')} (id {rid})")
     return lines
-
 
 # =========================
 # CALLBACKS
@@ -1049,7 +1056,6 @@ async def reminder_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(f"⏰ Snoozed for {minutes} minute(s).")
         return
 
-
 # =========================
 # COMMANDS
 # =========================
@@ -1065,7 +1071,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- plan my day\n"
         "- set them\n\n"
         "Commands:\n"
-        "/memory /notes /ideas /tasks /reviews /reminders /plan /weekplan /review /setup_lite /done <task_id> /delete <reminder_id> /clear"
+        "/memory /memories /notes /ideas /tasks /reviews /reminders /plan /weekplan /review /setup_lite /done <task_id> /delete <reminder_id> /clear"
     )
     await update.message.reply_text(msg)
 
@@ -1223,7 +1229,6 @@ async def setup_lite_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines += setup_weekly_communication(context.application, chat_id)
     await update.message.reply_text("\n".join(lines)[:3900])
 
-
 # =========================
 # MAIN CHAT
 # =========================
@@ -1234,7 +1239,6 @@ def parse_review_text(text: str):
 
     completed = blocked = priority = mood = ""
 
-    # structured format first
     for key in ["completed", "blocked", "priority", "mood"]:
         m = re.search(rf"{key}\s*=\s*([^,;]+)", low)
         if m:
@@ -1260,12 +1264,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     save_chat(update.effective_chat.id, "user", text)
 
-    # quick setup command
     if low in {"set them", "setup lite", "setup", "set up", "start jarvis lite"}:
         await setup_lite_cmd(update, context)
         return
 
-    # memory
     if low.startswith("remember "):
         content = text[len("remember "):].strip()
         special = extract_special_memory(content)
@@ -1286,19 +1288,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text_out[:3900])
         return
 
-    # note
     if low.startswith("note:") or low.startswith("note "):
         save_note(text.split(":", 1)[-1].strip())
         await update.message.reply_text("📝 Note saved.")
         return
 
-    # idea
     if low.startswith("idea:") or low.startswith("idea "):
         save_idea(text.split(":", 1)[-1].strip())
         await update.message.reply_text("💡 Idea saved.")
         return
 
-    # task
     if low.startswith("task:") or low.startswith("add task") or low.startswith("task "):
         task_text = text.split(":", 1)[-1].strip()
         if low.startswith("add task"):
@@ -1307,7 +1306,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📌 Task saved.")
         return
 
-    # review save
     review_parsed = parse_review_text(text)
     if review_parsed:
         completed, blocked, priority, mood = review_parsed
@@ -1315,7 +1313,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📘 Review saved.")
         return
 
-    # review request / plan / weekly
     if "plan my day" in low:
         await plan_cmd(update, context)
         return
@@ -1328,7 +1325,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await weekplan_cmd(update, context)
         return
 
-    # reminders
     if any(k in low for k in ["remind me", "reminder", "wake me"]):
         items = parse_reminder_items(text)
 
@@ -1401,7 +1397,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("I understood it as a reminder, but I could not parse the time.")
         return
 
-    # classification
     intent = classify_message(text)
 
     if intent == "memory":
@@ -1439,18 +1434,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await review_cmd(update, context)
         return
 
-    # normal chat
     reply = ai_chat_with_context(update.effective_chat.id, text)
     save_chat(update.effective_chat.id, "assistant", reply)
     await update.message.reply_text(reply[:3900])
-
 
 # =========================
 # STARTUP
 # =========================
 async def post_init(app):
     schedule_existing_reminders(app)
-
 
 # =========================
 # MAIN
