@@ -8,11 +8,7 @@ import requests
 import dateparser
 from dateparser.search import search_dates
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     MessageHandler,
@@ -58,7 +54,6 @@ def ensure_tables():
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
     """)
-
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS notes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,7 +61,6 @@ def ensure_tables():
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
     """)
-
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS ideas (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,7 +68,6 @@ def ensure_tables():
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
     """)
-
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS tasks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,7 +76,6 @@ def ensure_tables():
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
     """)
-
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS reviews (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -95,7 +87,6 @@ def ensure_tables():
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
     """)
-
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS reminders (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,7 +99,6 @@ def ensure_tables():
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
     """)
-
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS chat_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,7 +108,6 @@ def ensure_tables():
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
     """)
-
     conn.commit()
 
 
@@ -144,14 +133,12 @@ def migrate_reminders():
         cursor.execute("ALTER TABLE reminders ADD COLUMN chat_id INTEGER")
 
     cols = table_columns("reminders")
-
     if "time" in cols:
         cursor.execute("""
             UPDATE reminders
             SET trigger_time = COALESCE(trigger_time, time)
             WHERE trigger_time IS NULL OR trigger_time = ''
         """)
-
     if "repeat" in cols:
         cursor.execute("""
             UPDATE reminders
@@ -259,7 +246,7 @@ def parse_date_phrase(text: str) -> datetime | None:
     return None
 
 # =========================
-# CLEAN TEXT HELPERS
+# TEXT HELPERS
 # =========================
 def normalize_reminder_text(text: str) -> str:
     text = text.lower().strip()
@@ -285,7 +272,6 @@ def format_clock(h, m=None, ap=None):
 
 def extract_task_from_reminder(text: str) -> str:
     body = normalize_reminder_text(text)
-
     body = re.sub(r"(?i)^remind me(?: to)?\s*", "", body).strip()
 
     if " to " in body:
@@ -446,10 +432,7 @@ def get_tasks():
 
 
 def mark_task_done(task_id: int):
-    cursor.execute(
-        "UPDATE tasks SET status='done' WHERE id=?",
-        (task_id,),
-    )
+    cursor.execute("UPDATE tasks SET status='done' WHERE id=?", (task_id,))
     conn.commit()
 
 
@@ -478,24 +461,14 @@ def save_reminder(chat_id: int, task: str, trigger_time: datetime, repeat_minute
         INSERT INTO reminders (chat_id, rule_key, task, trigger_time, repeat_minutes, status)
         VALUES (?, ?, ?, ?, ?, 'pending')
         """,
-        (
-            chat_id,
-            rule_key,
-            task.strip(),
-            trigger_time.isoformat(),
-            int(repeat_minutes),
-        ),
+        (chat_id, rule_key, task.strip(), trigger_time.isoformat(), int(repeat_minutes)),
     )
     conn.commit()
     return cursor.lastrowid
 
 
 def upsert_rule_reminder(chat_id: int, rule_key: str, task: str, trigger_time: datetime, repeat_minutes: int):
-    row = cursor.execute(
-        "SELECT id FROM reminders WHERE rule_key=?",
-        (rule_key,),
-    ).fetchone()
-
+    row = cursor.execute("SELECT id FROM reminders WHERE rule_key=?", (rule_key,)).fetchone()
     trigger_time = normalize_dt(trigger_time)
 
     if row:
@@ -506,13 +479,7 @@ def upsert_rule_reminder(chat_id: int, rule_key: str, task: str, trigger_time: d
             SET chat_id=?, task=?, trigger_time=?, repeat_minutes=?, status='pending'
             WHERE id=?
             """,
-            (
-                chat_id,
-                task.strip(),
-                trigger_time.isoformat(),
-                int(repeat_minutes),
-                reminder_id,
-            ),
+            (chat_id, task.strip(), trigger_time.isoformat(), int(repeat_minutes), reminder_id),
         )
         conn.commit()
         return reminder_id
@@ -521,10 +488,7 @@ def upsert_rule_reminder(chat_id: int, rule_key: str, task: str, trigger_time: d
 
 
 def get_reminder(reminder_id: int):
-    return cursor.execute(
-        "SELECT * FROM reminders WHERE id=?",
-        (reminder_id,),
-    ).fetchone()
+    return cursor.execute("SELECT * FROM reminders WHERE id=?", (reminder_id,)).fetchone()
 
 
 def get_pending_reminders(chat_id: int):
@@ -540,10 +504,7 @@ def get_pending_reminders(chat_id: int):
 
 
 def mark_reminder_done(reminder_id: int):
-    cursor.execute(
-        "UPDATE reminders SET status='done' WHERE id=?",
-        (reminder_id,),
-    )
+    cursor.execute("UPDATE reminders SET status='done' WHERE id=?", (reminder_id,))
     conn.commit()
 
 # =========================
@@ -578,7 +539,12 @@ def classify_message(text: str) -> str:
 
     if any(k in low for k in ["remind me", "reminder", "wake me"]):
         return "reminder"
-    if low.startswith("remember "):
+    if (
+        low.startswith("remember ")
+        or "just remember" in low
+        or "not task" in low
+        or "remember it" in low
+    ):
         return "memory"
     if low.startswith("note:") or low.startswith("note "):
         return "note"
@@ -586,7 +552,7 @@ def classify_message(text: str) -> str:
         return "idea"
     if low.startswith("task:") or low.startswith("add task") or low.startswith("task "):
         return "task"
-    if "plan my day" in low or low in {"plan", "/plan"}:
+    if "plan my day" in low or "plan my tomorrow" in low or low in {"plan", "/plan"}:
         return "plan"
     if "review my day" in low or low in {"review", "/review"}:
         return "review"
@@ -692,12 +658,18 @@ def build_adaptive_plan():
     fixed = []
     for dt, title in plan:
         dt = normalize_dt(dt)
-        if title not in {"College (" + college_time + ")", "Gym (" + gym_time + ")", "Finish gym and return", "Eat and recover"} and dt <= now_ist():
+        if title not in {
+            "College (" + college_time + ")",
+            "Gym (" + gym_time + ")",
+            "Finish gym and return",
+            "Eat and recover",
+        } and dt <= now_ist():
             dt += timedelta(days=1)
         fixed.append((dt, title))
 
     fixed.sort(key=lambda x: x[0])
     return fixed
+
 
 def build_week_plan():
     return [
@@ -722,7 +694,6 @@ def parse_reminder_items(text: str):
     daily = any(k in low for k in ["every day", "everyday", "daily", "each day"])
     weekly = any(k in low for k in ["every week", "weekly", "each week"])
 
-    # in X minutes / hours
     m = re.search(r"(?i)^remind me in (\d+)\s*(minute|minutes|min|hour|hours|hr|hrs)\s*(?:to\s+)?(.+)$", low)
     if m:
         amount = int(m.group(1))
@@ -731,7 +702,6 @@ def parse_reminder_items(text: str):
         minutes = amount * 60 if unit in {"hour", "hours", "hr", "hrs"} else amount
         return [{"task": task, "when": now_ist() + timedelta(minutes=minutes), "repeat_minutes": 0}]
 
-    # remind me to TASK in X ...
     m = re.search(r"(?i)^remind me(?: to)? (.+?) in (\d+)\s*(minute|minutes|min|hour|hours|hr|hrs)$", low)
     if m:
         task = m.group(1).strip()
@@ -742,7 +712,6 @@ def parse_reminder_items(text: str):
 
     task = extract_task_from_reminder(low)
 
-    # weekday + times
     wd_match = re.search(r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", low)
     if wd_match:
         weekday = WEEKDAY_MAP[wd_match.group(1)]
@@ -762,7 +731,6 @@ def parse_reminder_items(text: str):
                 items.append({"task": task, "when": dt, "repeat_minutes": repeat_minutes})
             return items
 
-    # multiple times in one message
     times = TIME_RE.findall(low)
     if times:
         repeat_minutes = 1440 if daily else 0
@@ -781,8 +749,7 @@ def parse_reminder_items(text: str):
             items.append({"task": task, "when": dt, "repeat_minutes": repeat_minutes})
         return items
 
-    cleaned = re.sub(r"(?i)^remind me(?: to)?\s*", "", low).strip()
-    dt = parse_date_phrase(cleaned)
+    dt = parse_date_phrase(low)
     if dt:
         return [{"task": task, "when": dt, "repeat_minutes": 0}]
 
@@ -906,15 +873,9 @@ def schedule_base_job(app, row, first_time: datetime | None = None):
 
 
 def schedule_existing_reminders(app):
-    rows = cursor.execute(
-        """
-        SELECT *
-        FROM reminders
-        WHERE status='pending'
-        """
-    ).fetchall()
-
+    rows = cursor.execute("SELECT * FROM reminders WHERE status='pending'").fetchall()
     now = now_ist()
+
     for row in rows:
         try:
             trigger_time = normalize_dt(datetime.fromisoformat(row["trigger_time"]))
@@ -945,7 +906,7 @@ def schedule_rule_reminder(app, chat_id: int, rule_key: str, task: str, trigger_
     return reminder_id
 
 # =========================
-# SCHEDULES
+# DEFAULT SCHEDULES
 # =========================
 def setup_daily_routine(app, chat_id: int):
     morning = [
@@ -964,12 +925,10 @@ def setup_daily_routine(app, chat_id: int):
     ]
 
     lines = ["✅ Daily routine reminders set:"]
-
     for rule_key, task, hour, minute, repeat in morning:
         dt = next_time_today_or_tomorrow(hour, minute)
         rid = schedule_rule_reminder(app, chat_id, rule_key, task, dt, repeat)
         lines.append(f"- {task} at {dt.strftime('%I:%M %p')} (id {rid})")
-
     return lines
 
 
@@ -1313,7 +1272,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📘 Review saved.")
         return
 
-    if "plan my day" in low:
+    if "plan my day" in low or "plan my tomorrow" in low:
         await plan_cmd(update, context)
         return
 
